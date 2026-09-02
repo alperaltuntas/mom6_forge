@@ -16,7 +16,22 @@ from mom6_forge._supergrid import haversine
 from mom6_forge.grid import Grid
 from mom6_forge import mapping
 
-TX2_3_MESH = Path("/Users/altuntas/work/meshes/tx2_3v2_230415_ESMFmesh.nc")
+from utils import fetch_inputdata
+
+
+@pytest.fixture(scope="module")
+def tx2_3_mesh():
+    """tx2_3v2 ESMF mesh, fetched from CESM input data if not available locally."""
+    return fetch_inputdata("share/meshes/tx2_3v2_230415_ESMFmesh.nc")
+
+
+@pytest.fixture(scope="module")
+def rof_ocn_meshes():
+    """(runoff, ocean) ESMF mesh pair for end-to-end runoff mapping."""
+    return (
+        fetch_inputdata("share/meshes/rx1_nomask_181022_ESMFmesh.nc"),
+        fetch_inputdata("share/meshes/gx1v7_151008_ESMFmesh.nc"),
+    )
 
 
 def make_synthetic_grids():
@@ -453,14 +468,10 @@ def test_flatten_to_mesh_roundtrip():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not TX2_3_MESH.exists(),
-    reason=f"Mesh file not found: {TX2_3_MESH}",
-)
-def test_grid_from_esmf_mesh_flatten_to_mesh_mask_roundtrip():
+def test_grid_from_esmf_mesh_flatten_to_mesh_mask_roundtrip(tx2_3_mesh):
     """grid_from_esmf_mesh followed by flatten_to_mesh must recover the
     original elementMask exactly."""
-    mesh = xr.open_dataset(TX2_3_MESH)
+    mesh = xr.open_dataset(tx2_3_mesh)
 
     original_mask_1d = mesh["elementMask"].values  # shape (n_elements,)
 
@@ -571,19 +582,15 @@ def test_generate_esmf_map_via_xesmf_coastline_masking_only_coastal_nonzero(
         assert row_nnz[row] == 0
 
 
-@pytest.mark.skipif(
-    not TX2_3_MESH.exists(),
-    reason=f"Mesh file not found: {TX2_3_MESH}",
-)
-def test_generate_esmf_map_via_xesmf_coastline_masking_tx2_3v2(tmp_path):
+def test_generate_esmf_map_via_xesmf_coastline_masking_tx2_3v2(tmp_path, tx2_3_mesh):
     """Integration test on tx2_3v2 mesh: with coastline_masking=True,
     nonzero destination rows must be coastal cells."""
 
     mapping_file = tmp_path / "tx2_3v2_coast_nn.nc"
 
     mapping.generate_ESMF_map_via_xesmf(
-        src_mesh_path=TX2_3_MESH,
-        dst_mesh_path=TX2_3_MESH,
+        src_mesh_path=tx2_3_mesh,
+        dst_mesh_path=tx2_3_mesh,
         mapping_file=mapping_file,
         method="nearest_d2s",
         area_normalization=False,
@@ -592,7 +599,7 @@ def test_generate_esmf_map_via_xesmf_coastline_masking_tx2_3v2(tmp_path):
     )
 
     ds_map = xr.open_dataset(mapping_file)
-    dst_mesh = xr.open_dataset(TX2_3_MESH)
+    dst_mesh = xr.open_dataset(tx2_3_mesh)
     try:
         dst_grid = mapping.grid_from_esmf_mesh(dst_mesh)
 
@@ -657,3 +664,74 @@ def test_generate_esmf_map_via_xesmf_nonfast_path(monkeypatch):
 
     assert captured.get("weights") == "sentinel-weights"
     assert "weights_coo" not in captured
+
+
+# ---------------------------------------------------------------------------
+# gen_rof_maps end-to-end  (integration, real meshes)
+# ---------------------------------------------------------------------------
+
+
+def test_gen_rof_maps_end_to_end(tmp_path, rof_ocn_meshes):
+    """Full runoff mapping pipeline on rx1 -> gx1v7.
+
+    Covers generate_ESMF_map_via_xesmf with coastline masking,
+    compute_smoothing_weights (topography-aware BFS), and write_mapping_file.
+    """
+    rof_mesh, ocn_mesh = rof_ocn_meshes
+    rmax = fold = 500.0
+
+    mapping.gen_rof_maps(
+        rof_mesh, ocn_mesh, tmp_path, "rx1_to_g17", rmax=rmax, fold=fold
+    )
+
+    nn_path = tmp_path / "rx1_to_g17_nn.nc"
+    sm_path = tmp_path / f"rx1_to_g17_r{rmax:.0f}_f{fold:.0f}_nnsm.nc"
+    assert nn_path.exists(), f"missing {nn_path}"
+    assert sm_path.exists(), f"missing {sm_path}"
+
+    nn = xr.open_dataset(nn_path)
+    sm = xr.open_dataset(sm_path)
+
+    # Both maps describe the same source and destination grids.
+    for v in ("src_grid_dims", "dst_grid_dims"):
+        np.testing.assert_array_equal(nn[v].values, sm[v].values)
+
+    n_dst = int(np.prod(nn["dst_grid_dims"].values))
+    n_src = int(np.prod(nn["src_grid_dims"].values))
+
+    for ds, label in ((nn, "nearest neighbor"), (sm, "smoothed")):
+        row, col, S = ds["row"].values, ds["col"].values, ds["S"].values
+        assert row.shape == col.shape == S.shape, label
+        # Mapping files are 1-based and must stay inside the grids.
+        assert row.min() >= 1 and row.max() <= n_dst, label
+        assert col.min() >= 1 and col.max() <= n_src, label
+        assert np.all(np.isfinite(S)), f"non-finite weights in {label} map"
+        assert np.all(S >= 0.0), f"negative weights in {label} map"
+
+    # Smoothing spreads each runoff cell over a neighborhood, so the smoothed
+    # map must have strictly more nonzeros than the nearest-neighbor map.
+    assert sm["S"].size > nn["S"].size
+
+    # Smoothing redistributes runoff; it must not create or destroy any.
+    # Column sums are preserved per source cell, weighted by destination area.
+    area_b = nn["area_b"].values
+    tot_nn = np.bincount(
+        nn["col"].values - 1,
+        weights=nn["S"].values * area_b[nn["row"].values - 1],
+        minlength=n_src,
+    )
+    tot_sm = np.bincount(
+        sm["col"].values - 1,
+        weights=sm["S"].values * area_b[sm["row"].values - 1],
+        minlength=n_src,
+    )
+    active = tot_nn > 0
+    np.testing.assert_allclose(
+        tot_sm[active],
+        tot_nn[active],
+        rtol=1e-10,
+        err_msg="smoothing did not conserve area-weighted runoff",
+    )
+
+    nn.close()
+    sm.close()
