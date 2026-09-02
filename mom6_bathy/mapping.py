@@ -739,7 +739,9 @@ def generate_ESMF_map_via_esmpy(
     )
 
 
-def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=None, coastline_masking=False):
+def compute_smoothing_weights(
+    mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=None, coastline_masking=False
+):
     """Compute smoothing weights for a given mesh dataset, using a radius in kilometers.
 
     Parameters
@@ -759,8 +761,8 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
 
     Returns
     -------
-    weights : scipy.sparse.coo_matrix
-        The computed smoothing weights in coordinate (COO) format.
+    weights : scipy.sparse.csr_matrix
+        The computed smoothing weights in compressed sparse row (CSR) format.
     """
 
     if not isinstance(mesh_ds, xr.Dataset):
@@ -800,7 +802,7 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
         coastline_mask_bool = flatten_to_mesh(coastline_mask == 1).astype(bool)
 
     dst_is_cyclic_x = is_mesh_cyclic_x(mesh_ds)
-    nx = grid.sizes['nlon']
+    nx = grid.sizes["nlon"]
 
     # index of the cell to the left of cell i:
     left = np.arange(len(coords)) - 1
@@ -839,16 +841,18 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
     bot_left[has_bot] = left[bottom[has_bot]]
     bot_right[has_bot] = right[bottom[has_bot]]
 
-    # Precompute CSR adjacency structure (8-connectivity)
-    adj_list = []
+    # Precompute CSR adjacency structure (8-connectivity).
+    # Equivalent to appending each cell's non-(-1) neighbors in the order
+    # (left, right, top, bottom, top_left, top_right, bot_left, bot_right),
+    # but built with numpy rather than a per-cell Python loop.
+    all_neighbors = np.stack(
+        [left, right, top, bottom, top_left, top_right, bot_left, bot_right],
+        axis=1,
+    )
+    valid = all_neighbors != -1
     adj_offset = np.zeros(n_cells + 1, dtype=np.int64)
-    for c in range(n_cells):
-        nbrs = [n for n in (left[c], right[c], top[c], bottom[c],
-                            top_left[c], top_right[c], bot_left[c], bot_right[c])
-                if n != -1]
-        adj_list.extend(nbrs)
-        adj_offset[c + 1] = adj_offset[c] + len(nbrs)
-    adj_flat = np.array(adj_list, dtype=np.int64)
+    adj_offset[1:] = np.cumsum(valid.sum(axis=1))
+    adj_flat = all_neighbors[valid].astype(np.int64)
 
     # Convert inner-loop arrays to Python lists for fast scalar access
     # (avoids numpy scalar overhead on indexing, hashing, and comparison)
@@ -883,7 +887,9 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
                 data.append(1.0)
                 cells_processed += 1
                 if cells_processed % progress_interval == 0:
-                    print(f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)")
+                    print(
+                        f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)"
+                    )
                 continue
 
         # Cache origin xyz for crow's-fly distance checks
@@ -917,12 +923,12 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
                     dx = xi - nx_
                     dy = yi - ny_
                     dz = zi - nz_
-                    if dx*dx + dy*dy + dz*dz <= chord_rmax_sq:
+                    if dx * dx + dy * dy + dz * dz <= chord_rmax_sq:
                         # One-hop chord distance (≈ arc for adjacent cells)
                         hx = cx - nx_
                         hy = cy - ny_
                         hz = cz - nz_
-                        path_dist = current_dist + sqrt(hx*hx + hy*hy + hz*hz)
+                        path_dist = current_dist + sqrt(hx * hx + hy * hy + hz * hz)
                         discovered[neighbor] = path_dist
                         q.append((neighbor, path_dist))
                         nbr_indices.append(neighbor)
@@ -934,7 +940,9 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
             data.append(1.0)
             cells_processed += 1
             if cells_processed % progress_interval == 0:
-                print(f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)")
+                print(
+                    f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)"
+                )
             continue
 
         # Compute weights from path distances (topology-aware)
@@ -949,9 +957,11 @@ def compute_smoothing_weights(mesh_ds, rmax, fold=1.0, xv_data=None, yv_data=Non
 
         cells_processed += 1
         if cells_processed % progress_interval == 0:
-            print(f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)")
+            print(
+                f"  smoothing weights: {100 * cells_processed // n_active}% ({cells_processed}/{n_active} cells)"
+            )
 
-    weights = coo_matrix(
+    weights = csr_matrix(
         (data, (row_indices, col_indices)), shape=(len(coords), len(coords))
     )
     return weights
@@ -1083,10 +1093,7 @@ def gen_rof_maps(
         ocn_mesh = xr.open_dataset(ocn_mesh_path)
 
         sw = compute_smoothing_weights(
-            mesh_ds=ocn_mesh,
-            rmax=rmax,
-            fold=fold,
-            coastline_masking=True
+            mesh_ds=ocn_mesh, rmax=rmax, fold=fold, coastline_masking=True
         )
 
         # mesh dimensions
