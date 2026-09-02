@@ -1,20 +1,24 @@
-from mom6_bathy.topo import *
+import numpy as np
+import xarray as xr
+import pytest
+from mom6_forge.topo import *
+from mom6_forge.channel_width import ChannelWidth, ChannelWidthList
 
 
-def test_topo_from_version_control(get_rect_topo):
-    topo = get_rect_topo  # this topo has a version control directory
+def test_topo_from_version_control(get_rect_topo_with_vc):
+    topo = get_rect_topo_with_vc  # this topo has a version control directory
     topo_from_version_control = Topo.from_version_control(topo.domain_dir)
     assert topo_from_version_control.min_depth == topo.min_depth
     assert topo_from_version_control.depth.equals(topo.depth)
 
 
-def test_topo_from_topo_file(get_rect_topo, tmp_path):
-    topo = get_rect_topo
+def test_topo_from_topo_file(get_rect_topo_with_vc, tmp_path):
+    topo = get_rect_topo_with_vc
     j, i = 1, 1
     new_val = 12123
     old_val = topo.depth[j, i]
     command = DepthEditCommand(topo, [(j, i)], [new_val], old_values=[old_val])
-    command()  # execute command quietly so that the topo version control doesn't control it (this way if I did from version control, it wouldn't pick up this change)
+    command()  # execute command skip_version_control so that the topo version control doesn't control it (this way if I did from version control, it wouldn't pick up this change)
     assert not Topo.from_version_control(topo.domain_dir).depth.equals(
         topo.depth
     )  # Assert command was quiet and not registered in version control
@@ -33,8 +37,8 @@ def test_topo_from_topo_file(get_rect_topo, tmp_path):
     assert topo_from_file.depth[j, i] == 12123
 
 
-def test_send_entire_depth_change_to_tcm(get_rect_topo):
-    topo = get_rect_topo
+def test_send_entire_depth_change_to_tcm(get_rect_topo_with_vc):
+    topo = get_rect_topo_with_vc
     old_depth = topo.depth.copy()
     new_depth = old_depth + 5.0
     topo.send_entire_depth_change_to_tcm(new_depth)
@@ -42,14 +46,14 @@ def test_send_entire_depth_change_to_tcm(get_rect_topo):
     topo.tcm.undo()
     assert (topo.depth == old_depth).all()
     prev_hist = sum(1 for _ in topo.tcm.repo.iter_commits())
-    topo.send_entire_depth_change_to_tcm(new_depth, quietly=True)
+    topo.send_entire_depth_change_to_tcm(new_depth, skip_version_control=True)
     assert prev_hist == sum(
         1 for _ in topo.tcm.repo.iter_commits()
     )  # Assert no new commit
 
 
-def test_erase_selected_basin(get_rect_topo):
-    topo = get_rect_topo
+def test_erase_selected_basin(get_rect_topo_without_vc):
+    topo = get_rect_topo_without_vc
     # Make a land barrier in the middle
     topo.depth[2, :] = 0  # horizontal land strip
     topo.depth[:, 2] = 0  # vertical land strip
@@ -58,15 +62,15 @@ def test_erase_selected_basin(get_rect_topo):
 
     topo.erase_selected_basin(j, i)
     # Since we have a land barrier, only bottom left should be erased to zero
-    assert (topo.depth[:2, :2] == 0).all()
+    assert (topo.masked_depth[:2, :2] == 0).all()
     # Other basins are untouched
-    assert topo.depth[:2, 3:].equals(old_depth[:2, 3:])
-    assert topo.depth[3:, :2].equals(old_depth[3:, :2])
-    assert topo.depth[3:, 3:].equals(old_depth[3:, 3:])
+    assert topo.masked_depth[:2, 3:].equals(old_depth[:2, 3:])
+    assert topo.masked_depth[3:, :2].equals(old_depth[3:, :2])
+    assert topo.masked_depth[3:, 3:].equals(old_depth[3:, 3:])
 
 
-def test_erase_disconnected_basin(get_rect_topo):
-    topo = get_rect_topo
+def test_erase_disconnected_basin(get_rect_topo_without_vc):
+    topo = get_rect_topo_without_vc
     # Make a land barrier in the middle
     topo.depth[2, :] = 0  # horizontal land strip
     topo.depth[:, 2] = 0  # vertical land strip
@@ -75,9 +79,114 @@ def test_erase_disconnected_basin(get_rect_topo):
 
     topo.erase_disconnected_basin(j, i)
     # Since we have a land barrier, only bottom left should be erased to zero
-    assert topo.depth[:2, :2].equals(old_depth[:2, :2])
+    assert topo.masked_depth[:2, :2].equals(old_depth[:2, :2])
 
     # Other basins are erased
-    assert (topo.depth[:2, 3:] == 0).all()
-    assert (topo.depth[3:, :2] == 0).all()
-    assert (topo.depth[3:, 3:] == 0).all()
+    assert (topo.masked_depth[:2, 3:] == 0).all()
+    assert (topo.masked_depth[3:, :2] == 0).all()
+    assert (topo.masked_depth[3:, 3:] == 0).all()
+
+
+def test_topo_no_git(get_rect_topo_without_vc):
+    topo = get_rect_topo_without_vc
+    assert topo.tcm is None
+    # Make an edit
+    j, i = 1, 1
+    new_val = 12123
+    old_val = topo.depth[j, i]
+    command = DepthEditCommand(
+        topo, [(j, i)], [new_val], old_values=[old_val]
+    )  # This command should still work even without version control, but it just won't be registered in version control
+    topo.apply_edit(command)
+    assert topo.depth[j, i] == new_val
+
+
+# ---------------------------------------------------------------------------
+# Topo.from_esmf_mesh tests
+# ---------------------------------------------------------------------------
+
+
+def test_topo_from_esmf_mesh_roundtrip(get_rect_topo_with_vc, tmp_path):
+    topo = get_rect_topo_with_vc
+    # Stamp some land cells into the mask before writing
+    land_mask = topo.tmask.values.copy()
+    land_mask[:2, :3] = 0
+    topo._user_mask = xr.DataArray(land_mask, dims=["ny", "nx"])
+    mesh_path = str(tmp_path / "test.nc")
+    topo.write_esmf_mesh(mesh_path)
+    topo2 = Topo.from_esmf_mesh(mesh_path, git=False)
+    assert topo2.tmask.shape == topo.tmask.shape
+    assert topo2._grid.nx == topo._grid.nx
+    assert topo2._grid.ny == topo._grid.ny
+    np.testing.assert_array_equal(topo2.tmask.values, land_mask)
+
+
+def test_topo_from_esmf_mesh_accepts_dataset(get_rect_topo_with_vc, tmp_path):
+    topo = get_rect_topo_with_vc
+    mesh_path = str(tmp_path / "test.nc")
+    topo.write_esmf_mesh(mesh_path)
+    ds = xr.open_dataset(mesh_path)
+    topo2 = Topo.from_esmf_mesh(ds, git=False)
+    assert topo2.tmask.shape == topo.tmask.shape
+
+
+def test_topo_from_esmf_mesh_raises_without_mask(get_rect_topo_with_vc, tmp_path):
+    topo = get_rect_topo_with_vc
+    mesh_path = str(tmp_path / "with_mask.nc")
+    no_mask_path = str(tmp_path / "no_mask.nc")
+    topo._grid.supergrid.to_esmf_mesh(mesh_path, mask="all_unmasked")
+    # Simulate a mesh file with no elementMask, e.g. from an external tool
+    with xr.open_dataset(mesh_path) as ds:
+        ds.drop_vars("elementMask").load().to_netcdf(no_mask_path)
+    with pytest.raises(ValueError, match="elementMask"):
+        Topo.from_esmf_mesh(no_mask_path, git=False)
+
+
+def test_topo_channel_widths_none(get_rect_grid):
+    """channel_widths=None creates an empty ChannelWidthList."""
+    topo = Topo(get_rect_grid, min_depth=0, git=False)
+    assert isinstance(topo.channel_widths, ChannelWidthList)
+    assert len(topo.channel_widths.get_all()) == 0
+
+
+def test_topo_channel_widths_object(get_rect_grid):
+    """Passing a ChannelWidthList object attaches it directly."""
+    cwl = ChannelWidthList()
+    cwl.add(
+        ChannelWidth(
+            component="U_width",
+            lon1=-6.5,
+            lon2=-4.75,
+            lat1=35.6,
+            lat2=36.3,
+            width=12000.0,
+            place="St. of Gibralter",
+        )
+    )
+    topo = Topo(get_rect_grid, min_depth=0, git=False, channel_widths=cwl)
+    assert topo.channel_widths is cwl
+    assert len(topo.channel_widths.get_all()) == 1
+
+
+def test_topo_channel_widths_filepath(get_rect_grid, tmp_path):
+    """Passing a filepath loads ChannelWidthList from disk."""
+    cwl = ChannelWidthList()
+    cwl.add(
+        ChannelWidth(
+            component="U_width",
+            lon1=-6.5,
+            lon2=-4.75,
+            lat1=35.6,
+            lat2=36.3,
+            width=12000.0,
+            place="St. of Gibralter",
+        )
+    )
+    filepath = tmp_path / "channels.txt"
+    cwl.write(filepath)
+
+    topo = Topo(get_rect_grid, min_depth=0, git=False, channel_widths=filepath)
+    loaded = topo.channel_widths.get_all()
+    assert len(loaded) == 1
+    assert loaded[0].component == "U_width"
+    assert loaded[0].place == "St. of Gibralter"
